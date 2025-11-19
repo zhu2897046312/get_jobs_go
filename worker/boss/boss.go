@@ -1,586 +1,616 @@
 package boss
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/url"
-	"os"
-	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
-	"get_jobs_go/application/service"
+
+	"get_jobs_go/config"
+	"get_jobs_go/service"
+	"get_jobs_go/utils"
+
 	"github.com/playwright-community/playwright-go"
 )
 
-type Blacklist struct {
-	Companies  []string `json:"companies"`
-	Recruiters []string `json:"recruiters"`
-	Jobs       []string `json:"jobs"`
+// Boss 结构体对应Java的Boss类
+type Boss struct {
+	page              playwright.Page
+	config            *config.BossConfig
+	bossService       *service.BossService
+	aiService         *service.AiService
+	blackCompanies    map[string]bool
+	blackRecruiters   map[string]bool
+	blackJobs         map[string]bool
+	encryptIdToUserId sync.Map
+	progressCallback  ProgressCallback
+	shouldStopCallback func() bool
+	resultList        []*utils.Job
+	mu                sync.RWMutex
 }
 
-type BossWorker struct {
-	page         playwright.Page
-	config       *BossConfig
-	db           service.DBService
-	aiService    AIService
-	blacklist    *Blacklist
-	stopChan     chan struct{}
-	progressChan chan ProgressMessage
-}
+// ProgressCallback 进度回调函数类型
+type ProgressCallback func(message string, current, total int)
 
-type ProgressMessage struct {
-	Message string `json:"message"`
-	Current int    `json:"current"`
-	Total   int    `json:"total"`
-}
-
-// type DBService interface {
-// 	GetBlacklists() (*Blacklist, error)
-// 	SaveJob(job *JobDetail) error
-// 	UpdateDeliveryStatus(encryptID, encryptUserID, status string) error
-// 	JobExists(encryptID, encryptUserID string) bool
-// }
-
-type AIService interface {
-	GenerateGreeting(introduce, keyword, jobName, jobDesc, reference string) (string, error)
-}
-
-func NewBossWorker(cfg *BossConfig, db service.DBService, ai AIService) *BossWorker {
-	return &BossWorker{
-		config:       cfg,
-		db:           db,
-		aiService:    ai,
-		stopChan:     make(chan struct{}),
-		progressChan: make(chan ProgressMessage, 100),
+// NewBoss 创建Boss实例
+func NewBoss(
+	bossService *service.BossService,
+	aiService *service.AiService,
+) *Boss {
+	return &Boss{
+		bossService:     bossService,
+		aiService:       aiService,
+		blackCompanies:  make(map[string]bool),
+		blackRecruiters: make(map[string]bool),
+		blackJobs:       make(map[string]bool),
+		resultList:      make([]*utils.Job, 0),
 	}
 }
 
-func (b *BossWorker) SetPage(page playwright.Page) {
+// SetPage 设置Playwright页面
+func (b *Boss) SetPage(page playwright.Page) {
 	b.page = page
 }
 
-func (b *BossWorker) Progress() <-chan ProgressMessage {
-	return b.progressChan
+// SetConfig 设置配置
+func (b *Boss) SetConfig(config *config.BossConfig) {
+	b.config = config
 }
 
-// 准备阶段：加载黑名单
-func (b *BossWorker) Prepare() error {
-	blacklists, err := b.db.GetBlacklists()
+// SetProgressCallback 设置进度回调
+func (b *Boss) SetProgressCallback(callback ProgressCallback) {
+	b.progressCallback = callback
+}
+
+// SetShouldStopCallback 设置停止回调
+func (b *Boss) SetShouldStopCallback(callback func() bool) {
+	b.shouldStopCallback = callback
+}
+
+// Prepare 准备阶段：加载黑名单
+func (b *Boss) Prepare() error {
+	// 从数据库加载黑名单
+	blackCompanies, err := b.bossService.GetBlackCompanies()
 	if err != nil {
-		return fmt.Errorf("加载黑名单失败: %w", err)
+		return fmt.Errorf("加载公司黑名单失败: %v", err)
 	}
-	b.blacklist = blacklists
+	b.blackCompanies = blackCompanies
+
+	blackRecruiters, err := b.bossService.GetBlackRecruiters()
+	if err != nil {
+		return fmt.Errorf("加载招聘者黑名单失败: %v", err)
+	}
+	b.blackRecruiters = blackRecruiters
+
+	blackJobs, err := b.bossService.GetBlackJobs()
+	if err != nil {
+		return fmt.Errorf("加载职位黑名单失败: %v", err)
+	}
+	b.blackJobs = blackJobs
 
 	log.Printf("黑名单加载完成: 公司(%d) 招聘者(%d) 职位(%d)",
-		len(blacklists.Companies), len(blacklists.Recruiters), len(blacklists.Jobs))
+		len(b.blackCompanies), len(b.blackRecruiters), len(b.blackJobs))
 
 	return nil
 }
 
-// 主执行入口
-func (b *BossWorker) Execute(ctx context.Context) (int, error) {
-	var totalPosted int
+// Execute 执行投递
+func (b *Boss) Execute() int {
+	if b.shouldStopCallback != nil && b.shouldStopCallback() {
+		b.progressCallback("用户取消投递", 0, 0)
+		return 0
+	}
 
+	totalCount := 0
 	for _, cityCode := range b.config.CityCode {
-		if b.shouldStop() {
-			b.sendProgress("用户取消投递", 0, 0)
-			return totalPosted, nil
+		if b.shouldStopCallback != nil && b.shouldStopCallback() {
+			b.progressCallback("用户取消投递", 0, 0)
+			break
 		}
 
-		posted, err := b.postJobByCity(ctx, cityCode)
-		if err != nil {
-			return totalPosted, err
-		}
-		totalPosted += posted
+		count := b.postJobByCity(cityCode)
+		totalCount += count
 
-		if b.shouldStop() {
-			b.sendProgress("用户取消投递", 0, 0)
+		if b.shouldStopCallback != nil && b.shouldStopCallback() {
+			b.progressCallback("用户取消投递", 0, 0)
 			break
 		}
 	}
 
-	return totalPosted, nil
+	return totalCount
 }
 
-// core/city_poster.go
-func (b *BossWorker) postJobByCity(ctx context.Context, cityCode string) (int, error) {
-	var totalPosted int
+// GetResultList 获取结果列表
+func (b *Boss) GetResultList() []*utils.Job {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	
+	result := make([]*utils.Job, len(b.resultList))
+	copy(result, b.resultList)
+	return result
+}
+
+// postJobByCity 按城市投递
+func (b *Boss) postJobByCity(cityCode string) int {
+	searchUrl := b.getSearchUrl(cityCode)
+	totalPostCount := 0
 
 	for _, keyword := range b.config.Keywords {
-		if b.shouldStop() {
-			return totalPosted, nil
+		if b.shouldStopCallback != nil && b.shouldStopCallback() {
+			return totalPostCount
 		}
 
-		posted, err := b.searchAndPostJobs(ctx, cityCode, keyword)
-		if err != nil {
-			return totalPosted, err
-		}
-		totalPosted += posted
+		postCount := b.postJobsByKeyword(searchUrl, keyword)
+		totalPostCount += postCount
+		log.Printf("【%s】岗位已投递完毕！已投递岗位数量: %d", keyword, postCount)
 	}
 
-	return totalPosted, nil
+	return totalPostCount
 }
 
-func (b *BossWorker) searchAndPostJobs(ctx context.Context, cityCode, keyword string) (int, error) {
-	// 构建搜索URL
-	searchURL := b.buildSearchURL(cityCode, keyword)
+// postJobsByKeyword 按关键词投递
+func (b *Boss) postJobsByKeyword(searchUrl, keyword string) int {
+	encodedKeyword := url.QueryEscape(keyword)
+	fullUrl := searchUrl + "&query=" + encodedKeyword
 
 	// 导航到搜索页面
-	if _, err := b.page.Goto(searchURL, playwright.PageGotoOptions{
+	_, err := b.page.Goto(fullUrl, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-	}); err != nil {
-		return 0, fmt.Errorf("导航到搜索页面失败: %w", err)
+		Timeout:   playwright.Float(15000),
+	})
+	if err != nil {
+		log.Printf("导航到搜索页面失败: %v", err)
+		return 0
 	}
 
-	// 等待职位列表加载
-	// 修正后的代码
-	// 等待职位列表加载
-	_, err := b.page.WaitForSelector("ul.rec-job-list", playwright.PageWaitForSelectorOptions{
+	// 等待列表容器出现
+	_, err = b.page.WaitForSelector("//ul[contains(@class, 'rec-job-list')]", playwright.PageWaitForSelectorOptions{
 		Timeout: playwright.Float(60000),
 	})
 	if err != nil {
-		return 0, fmt.Errorf("等待职位列表超时: %w", err)
+		log.Printf("等待岗位列表加载失败: %v", err)
+		return 0
 	}
 
-	// 滚动加载所有职位
-	if err := b.scrollToLoadAllJobs(); err != nil {
-		return 0, fmt.Errorf("滚动加载职位失败: %w", err)
-	}
+	// 滚动加载所有岗位
+	b.scrollToLoadAllJobs(keyword)
 
-	// 获取所有职位卡片
-	cards, err := b.page.Locator("ul.rec-job-list li.job-card-box").All()
+	// 获取最终岗位数量
+	cards, err := b.page.QuerySelectorAll("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]")
 	if err != nil {
-		return 0, fmt.Errorf("获取职位卡片失败: %w", err)
+		log.Printf("获取岗位卡片失败: %v", err)
+		return 0
 	}
 
-	log.Printf("【%s】岗位已全部加载，总数:%d", keyword, len(cards))
-	b.sendProgress("岗位加载完成："+keyword, 0, len(cards))
+	loadedCount := len(cards)
+	log.Printf("【%s】岗位已全部加载，总数: %d", keyword, loadedCount)
+	b.progressCallback("岗位加载完成："+keyword, 0, loadedCount)
 
-	var postedCount int
-	for i := 0; i < len(cards); i++ {
-		if b.shouldStop() {
-			return postedCount, nil
+	// 回到页面顶部
+	b.page.Evaluate("window.scrollTo(0, 0);")
+	utils.Sleep(1)
+
+	// 逐个处理岗位
+	postCount := 0
+	for i := 0; i < loadedCount; i++ {
+		if b.shouldStopCallback != nil && b.shouldStopCallback() {
+			b.progressCallback("用户取消投递", i, loadedCount)
+			return postCount
 		}
 
-		// 重新获取卡片（避免元素过期）
-		cards, _ = b.page.Locator("ul.rec-job-list li.job-card-box").All()
-		if i >= len(cards) {
-			break
-		}
-
-		card := cards[i]
-		if err := b.processSingleJob(ctx, card, keyword, i, len(cards)); err != nil {
-			log.Printf("处理职位失败: %v", err)
+		// 重新获取卡片避免元素过期
+		cards, err = b.page.QuerySelectorAll("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]")
+		if err != nil || i >= len(cards) {
 			continue
 		}
-		postedCount++
+
+		job, shouldSkip := b.processJobCard(cards[i], i, loadedCount)
+		if shouldSkip {
+			continue
+		}
+
+		// 投递简历
+		b.progressCallback("正在投递："+job.JobName, i+1, loadedCount)
+		success := b.resumeSubmission(keyword, job)
+		if success {
+			postCount++
+		}
 
 		// 滚动避免页面刷新问题
 		if i >= 5 {
-			b.page.Evaluate("window.scrollBy(0, 140)")
-			time.Sleep(1 * time.Second)
+			b.page.Evaluate("window.scrollBy(0, 140);")
+			utils.Sleep(1)
 		}
 	}
 
-	log.Printf("【%s】岗位已投递完毕！已投递岗位数量:%d", keyword, postedCount)
-	return postedCount, nil
+	return postCount
 }
 
-// core/job_processor.go
-func (b *BossWorker) processSingleJob(ctx context.Context, card playwright.Locator, keyword string, index, total int) error {
-	// 点击卡片获取详情
-	jobDetail, err := b.clickAndGetJobDetail(card, index)
-	if err != nil {
-		return fmt.Errorf("获取职位详情失败: %w", err)
-	}
-
-	// 保存职位数据到数据库
-	if !b.db.JobExists(jobDetail.EncryptID, jobDetail.EncryptUserID) {
-		if err := b.db.SaveJob(jobDetail); err != nil {
-			log.Printf("保存职位数据失败: %v", err)
+// processJobCard 处理单个岗位卡片
+func (b *Boss) processJobCard(card playwright.ElementHandle, index, total int) (*utils.Job, bool) {
+	var detailResp *playwright.Response
+	
+	// 点击卡片并等待详情响应
+	if index == 0 && total > 1 {
+		// 第一个卡片特殊处理
+		secondCard, err := b.page.QuerySelector("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]")
+		if err == nil && secondCard != nil {
+			secondCard.Click()
+			utils.Sleep(1)
 		}
 	}
 
-	// 过滤检查
-	if b.shouldFilterJob(jobDetail) {
-		return nil // 被过滤，不投递
-	}
-
-	// 执行投递
-	b.sendProgress("正在投递："+jobDetail.JobName, index+1, total)
-	if err := b.resumeSubmission(ctx, jobDetail, keyword); err != nil {
-		// 更新状态为投递失败
-		b.db.UpdateDeliveryStatus(jobDetail.EncryptID, jobDetail.EncryptUserID, "投递失败")
-		return fmt.Errorf("投递失败: %w", err)
-	}
-
-	// 更新状态为已投递
-	b.db.UpdateDeliveryStatus(jobDetail.EncryptID, jobDetail.EncryptUserID, "已投递")
-	return nil
-}
-
-func (b *BossWorker) clickAndGetJobDetail(card playwright.Locator, index int) (*JobDetail, error) {
-	var jobDetail *JobDetail
-
-	// 监听岗位详情API响应
-	responseChan := make(chan playwright.Response, 1)
+	// 设置响应监听
+	responseChan := make(chan *playwright.Response, 1)
 	b.page.OnResponse(func(response playwright.Response) {
-		if strings.Contains(response.URL(), "/wapi/zpgeek/job/detail.json") &&
-			response.Request().Method() == "GET" {
+		url := response.URL()
+		if strings.Contains(url, "/wapi/zpgeek/job/detail.json") && 
+		   strings.EqualFold(response.Request().Method(), "GET") {
 			select {
-			case responseChan <- response:
+			case responseChan <- &response:
 			default:
 			}
 		}
 	})
 
-	// 点击卡片
-	if index == 0 {
-		// 第一个卡片特殊处理：先点第二个再点第一个
-		cards := b.page.Locator("ul.rec-job-list li.job-card-box")
-		cards_count, err := cards.Count()
-		if err != nil {
-			return nil, err
-		}
-		if cards_count > 1 {
-			cards.Nth(1).Click()
-			time.Sleep(1 * time.Second)
-		}
-		cards.Nth(0).Click()
-	} else {
-		card.Click()
-	}
-
-	// 等待API响应
+	// 点击当前卡片
+	card.Click()
+	
+	// 等待响应或超时
 	select {
-	case response := <-responseChan:
-		body, err := response.Body()
-		if err != nil {
-			return nil, err
-		}
-		jobDetail = b.parseJobDetailJSON(string(body))
+	case detailResp = <-responseChan:
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("获取职位详情超时")
 	}
 
-	time.Sleep(1 * time.Second)
-	return jobDetail, nil
+	b.page.RemoveListeners("response")
+
+	// 解析岗位详情
+	job, shouldSkip := b.parseJobDetail(detailResp)
+	return job, shouldSkip
 }
 
-func (b *BossWorker) parseJobDetailJSON(body string) *JobDetail {
-	// 解析JSON响应，提取职位信息
-	// 这里需要根据实际的Boss直聘API响应结构来解析
-	// 返回JobDetail结构体
-	return &JobDetail{}
+// parseJobDetail 解析岗位详情
+func (b *Boss) parseJobDetail(detailResp *playwright.Response) (*utils.Job, bool) {
+	if detailResp == nil {
+		return nil, true
+	}
+
+	body, err := (*detailResp).Body()
+	if err != nil {
+		return nil, true
+	}
+
+	// 解析JSON响应
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(body, &responseData); err != nil {
+		return nil, true
+	}
+
+	// 提取岗位信息
+	zpData, _ := responseData["zpData"].(map[string]interface{})
+	if zpData == nil {
+		return nil, true
+	}
+
+	jobInfo, _ := zpData["jobInfo"].(map[string]interface{})
+	brandInfo, _ := zpData["brandComInfo"].(map[string]interface{})
+	bossInfo, _ := zpData["bossInfo"].(map[string]interface{})
+
+	// 构建Job对象
+	job := &utils.Job{
+		JobName:    b.getStringValue(jobInfo, "jobName"),
+		Salary:     b.getStringValue(jobInfo, "salaryDesc"),
+		CompanyName: b.getStringValue(brandInfo, "brandName"),
+		Recruiter:  b.getStringValue(bossInfo, "name"),
+		JobInfo:    b.getStringValue(jobInfo, "postDescription"),
+	}
+
+	// 构建工作地区
+	var tags []string
+	if location := b.getStringValue(jobInfo, "locationName"); location != "" {
+		tags = append(tags, location)
+	}
+	if experience := b.getStringValue(jobInfo, "experienceName"); experience != "" {
+		tags = append(tags, experience)
+	}
+	if degree := b.getStringValue(jobInfo, "degreeName"); degree != "" {
+		tags = append(tags, degree)
+	}
+	job.JobArea = strings.Join(tags, ", ")
+
+	// 过滤检查
+	if b.shouldFilterJob(job, bossInfo) {
+		return nil, true
+	}
+
+	return job, false
 }
 
-// core/filter.go
-func (b *BossWorker) shouldFilterJob(job *JobDetail) bool {
+// shouldFilterJob 检查是否应该过滤该岗位
+func (b *Boss) shouldFilterJob(job *utils.Job, bossInfo map[string]interface{}) bool {
 	// 职位黑名单过滤
-	if b.isInBlacklist(job.JobName, b.blacklist.Jobs) {
+	if b.isInBlacklist(job.JobName, b.blackJobs) {
 		log.Printf("被过滤：职位黑名单命中 | 公司：%s | 岗位：%s", job.CompanyName, job.JobName)
 		return true
 	}
 
+	// HR活跃状态过滤
+	if b.config.FilterDeadHR {
+		activeTime := b.getStringValue(bossInfo, "activeTimeDesc")
+		if strings.Contains(activeTime, "年") {
+			log.Printf("被过滤：HR活跃状态包含'年' | 公司：%s | 岗位：%s | 活跃：%s", 
+				job.CompanyName, job.JobName, activeTime)
+			return true
+		}
+	}
+
 	// 公司黑名单过滤
-	if b.isInBlacklist(job.CompanyName, b.blacklist.Companies) {
+	if b.isInBlacklist(job.CompanyName, b.blackCompanies) {
 		log.Printf("被过滤：公司黑名单命中 | 公司：%s | 岗位：%s", job.CompanyName, job.JobName)
 		return true
 	}
 
 	// 招聘者黑名单过滤
-	if b.isInBlacklist(job.HRPosition, b.blacklist.Recruiters) {
-		log.Printf("被过滤：招聘者黑名单命中 | 公司：%s | 岗位：%s | 招聘者：%s",
-			job.CompanyName, job.JobName, job.HRPosition)
-		return true
-	}
-
-	// HR活跃状态过滤
-	if b.config.FilterDeadHR && b.isHRInactive(job.HRActiveStatus) {
-		log.Printf("被过滤：HR不活跃 | 公司：%s | 岗位：%s | 活跃：%s",
-			job.CompanyName, job.JobName, job.HRActiveStatus)
-		return true
-	}
-
-	// 薪资过滤
-	if b.isSalaryNotExpected(job.Salary) {
-		log.Printf("被过滤：薪资不符合预期 | 公司：%s | 岗位：%s | 薪资：%s",
-			job.CompanyName, job.JobName, job.Salary)
+	hrPosition := b.getStringValue(bossInfo, "title")
+	if b.isInBlacklist(hrPosition, b.blackRecruiters) {
+		log.Printf("被过滤：招聘者黑名单命中 | 公司：%s | 岗位：%s | 招聘者：%s", 
+			job.CompanyName, job.JobName, hrPosition)
 		return true
 	}
 
 	return false
 }
 
-func (b *BossWorker) isInBlacklist(text string, blacklist []string) bool {
-	if text == "" || len(blacklist) == 0 {
-		return false
-	}
-
-	for _, item := range blacklist {
-		if strings.Contains(text, item) {
+// isInBlacklist 检查是否在黑名单中
+func (b *Boss) isInBlacklist(value string, blacklist map[string]bool) bool {
+	for blackItem := range blacklist {
+		if strings.Contains(value, blackItem) {
 			return true
 		}
 	}
 	return false
 }
 
-func (b *BossWorker) isHRInactive(activeStatus string) bool {
-	// 包含"年"视为不活跃
-	return strings.Contains(activeStatus, "年")
-}
-
-func (b *BossWorker) isSalaryNotExpected(salary string) bool {
-	if len(b.config.ExpectedSalary) < 2 {
+// resumeSubmission 投递简历
+func (b *Boss) resumeSubmission(keyword string, job *utils.Job) bool {
+	if b.shouldStopCallback != nil && b.shouldStopCallback() {
+		log.Printf("停止指令已触发，跳过投递 | 公司：%s | 岗位：%s", job.CompanyName, job.JobName)
 		return false
 	}
 
-	// 解析薪资范围并与期望薪资比较
-	// 实现薪资解析逻辑
-	return false
-}
+	if b.config.Debugger {
+		log.Printf("调试模式：仅遍历岗位，不投递 | 公司：%s | 岗位：%s", job.CompanyName, job.JobName)
+		return false
+	}
 
-func (b *BossWorker) openJobDetailPage() (playwright.Page, string, error) {
 	// 查找"查看更多信息"按钮
-	moreInfoBtn := b.page.Locator("a.more-job-btn")
-	moreInfoBtn_count, err := moreInfoBtn.Count()
-	if err != nil {
-		return nil, "", err
-	}
-	if moreInfoBtn_count == 0 {
-		return nil, "", fmt.Errorf("未找到\"查看更多信息\"按钮")
+	moreInfoBtn, err := b.page.QuerySelector("a.more-job-btn")
+	if err != nil || moreInfoBtn == nil {
+		log.Printf("未找到'查看更多信息'按钮，跳过...")
+		return false
 	}
 
-	// 获取详情页链接
-	href, err := moreInfoBtn.First().GetAttribute("href")
+	href, err := moreInfoBtn.GetAttribute("href")
 	if err != nil || !strings.HasPrefix(href, "/job_detail/") {
-		return nil, "", fmt.Errorf("未获取到有效的岗位详情链接")
+		log.Printf("未获取到岗位详情链接，跳过...")
+		return false
 	}
 
-	detailURL := "https://www.zhipin.com" + href
-
-	// 在新窗口打开详情页
-	detailPage, err := b.page.Context().NewPage()
+	detailUrl := "https://www.zhipin.com" + href
+	
+	// 在新页面打开详情
+	context := b.page.Context()
+	newPage, err := context.NewPage()
 	if err != nil {
-		return nil, "", err
+		log.Printf("创建新页面失败: %v", err)
+		return false
+	}
+	defer newPage.Close()
+
+	_, err = newPage.Goto(detailUrl, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+	})
+	if err != nil {
+		log.Printf("导航到详情页失败: %v", err)
+		return false
 	}
 
-	if _, err := detailPage.Goto(detailURL); err != nil {
-		detailPage.Close()
-		return nil, "", err
-	}
-
-	time.Sleep(1 * time.Second)
-	return detailPage, detailURL, nil
-}
-
-// 修正后的代码
-func (b *BossWorker) clickChatButton(detailPage playwright.Page) error {
 	// 查找立即沟通按钮
-	chatBtn := detailPage.Locator("a.btn-startchat, a.op-btn-chat")
+	chatBtn, found := b.waitForChatButton(newPage)
+	if !found {
+		log.Printf("未找到立即沟通按钮，跳过岗位: %s", job.JobName)
+		return false
+	}
 
+	chatBtn.Click()
+	utils.Sleep(1)
+
+	// 等待聊天输入框
+	inputLocator, inputReady := b.waitForChatInput(newPage)
+	if !inputReady {
+		log.Printf("聊天输入框未出现，跳过: %s", job.JobName)
+		return false
+	}
+
+	// 生成并发送消息
+	message := b.generateMessage(keyword, job)
+	b.sendChatMessage(newPage, inputLocator, message)
+
+	// 发送图片简历
+	imgResume := false
+	if b.config.SendImgResume {
+		imgResume = b.sendImageResume(newPage)
+	}
+
+	log.Printf("投递完成 | 公司：%s | 岗位：%s | 薪资：%s | 招呼语：%s | 图片简历：%v", 
+		job.CompanyName, job.JobName, job.Salary, message, imgResume)
+
+	// 更新投递状态
+	b.updateDeliveryStatus(detailUrl, job)
+	
+	b.mu.Lock()
+	b.resultList = append(b.resultList, job)
+	b.mu.Unlock()
+
+	return true
+}
+
+// 等待聊天按钮
+func (b *Boss) waitForChatButton(page playwright.Page) (playwright.ElementHandle, bool) {
 	for i := 0; i < 5; i++ {
-		if b.shouldStop() {
-			return fmt.Errorf("用户取消操作")
+		if b.shouldStopCallback != nil && b.shouldStopCallback() {
+			return nil, false
 		}
 
-		chatBtnCount, err := chatBtn.Count()
-		if err != nil {
-			log.Printf("查找立即沟通按钮失败: %v", err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		if chatBtnCount > 0 {
-			// 获取按钮文本内容
-			textContent, err := chatBtn.First().TextContent()
-			if err != nil {
-				log.Printf("获取按钮文本失败: %v", err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			if strings.Contains(textContent, "立即沟通") {
-				if err := chatBtn.First().Click(); err != nil {
-					log.Printf("点击立即沟通按钮失败: %v", err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				return nil
+		chatBtn, err := page.QuerySelector("a.btn-startchat, a.op-btn-chat")
+		if err == nil && chatBtn != nil {
+			text, _ := chatBtn.TextContent()
+			if strings.Contains(text, "立即沟通") {
+				return chatBtn, true
 			}
 		}
-
-		time.Sleep(1 * time.Second)
+		utils.Sleep(1)
 	}
-
-	return fmt.Errorf("未找到立即沟通按钮")
+	return nil, false
 }
 
-func (b *BossWorker) generateGreetingMessage(keyword string, job *JobDetail) string {
-	if !b.config.EnableAI || job.JobInfo == "" {
-		return b.config.SayHi
-	}
-
-	message, err := b.aiService.GenerateGreeting("", keyword, job.JobName, job.JobInfo, b.config.SayHi)
-	if err != nil {
-		log.Printf("AI生成招呼语失败: %v", err)
-		return b.config.SayHi
-	}
-
-	return message
-}
-
-// 发送聊天消息的函数也需要调整
-func (b *BossWorker) sendChatMessage(detailPage playwright.Page, message string) error {
-	// 定位聊天输入框
-	inputLocator := detailPage.Locator("div#chat-input.chat-input[contenteditable='true'], textarea.input-area")
-
+// 等待聊天输入框
+func (b *Boss) waitForChatInput(page playwright.Page) (playwright.ElementHandle, bool) {
 	for i := 0; i < 10; i++ {
-		if b.shouldStop() {
-			return fmt.Errorf("用户取消操作")
+		if b.shouldStopCallback != nil && b.shouldStopCallback() {
+			return nil, false
 		}
 
-		inputCount, err := inputLocator.Count()
-		if err != nil {
-			log.Printf("查找输入框失败: %v", err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		if inputCount > 0 {
-			isVisible, err := inputLocator.First().IsVisible()
-			if err != nil {
-				log.Printf("检查输入框可见性失败: %v", err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			if isVisible {
-				break
+		inputLocator, err := page.QuerySelector("div#chat-input.chat-input[contenteditable='true'], textarea.input-area")
+		if err == nil && inputLocator != nil {
+			visible, _ := inputLocator.IsVisible()
+			if visible {
+				return inputLocator, true
 			}
 		}
-		time.Sleep(1 * time.Second)
+		utils.Sleep(1)
+	}
+	return nil, false
+}
+
+// generateMessage 生成消息内容
+func (b *Boss) generateMessage(keyword string, job *utils.Job) string {
+	if b.config.EnableAI && job.JobInfo != "" {
+		aiMessage, err := b.aiService.SendRequest(b.buildAIPrompt(keyword, job))
+		if err == nil && aiMessage != "" && !strings.Contains(strings.ToLower(aiMessage), "false") {
+			return aiMessage
+		}
+	}
+	return b.config.SayHi
+}
+
+// buildAIPrompt 构建AI提示词
+func (b *Boss) buildAIPrompt(keyword string, job *utils.Job) string {
+	aiConfig, err := b.aiService.GetAiConfig()
+	introduce := ""
+	if err == nil && aiConfig != nil {
+		introduce = aiConfig.Introduce
 	}
 
-	inputCount, err := inputLocator.Count()
-	if err != nil || inputCount == 0 {
-		return fmt.Errorf("聊天输入框未出现")
-	}
+	return fmt.Sprintf("请基于以下信息生成简洁友好的中文打招呼语，不超过60字：\n个人介绍：%s\n关键词：%s\n职位名称：%s\n职位描述：%s\n参考语：%s",
+		introduce, keyword, job.JobName, job.JobInfo, b.config.SayHi)
+}
 
-	input := inputLocator.First()
-	if err := input.Click(); err != nil {
-		return fmt.Errorf("点击输入框失败: %w", err)
-	}
-
-	// 判断输入框类型并输入文本
+// sendChatMessage 发送聊天消息
+func (b *Boss) sendChatMessage(page playwright.Page, input playwright.ElementHandle, message string) {
 	tagName, err := input.Evaluate("el => el.tagName.toLowerCase()", nil)
-	if err != nil {
-		return fmt.Errorf("获取输入框类型失败: %w", err)
-	}
-
-	if tagName == "textarea" {
-		if err := input.Fill(message); err != nil {
-			return fmt.Errorf("填写消息失败: %w", err)
-		}
+	if err == nil && tagName == "textarea" {
+		input.Fill(message)
 	} else {
-		if _, err := input.Evaluate(`(el, msg) => { 
-            el.innerText = msg; 
-            el.dispatchEvent(new Event('input')); 
-        }`, message); err != nil {
-			return fmt.Errorf("设置contenteditable内容失败: %w", err)
-		}
+		input.Evaluate(fmt.Sprintf(`(el, msg) => { 
+			el.innerText = %q; 
+			el.dispatchEvent(new Event('input')); 
+		}`, message), nil)
 	}
 
 	// 点击发送按钮
-	sendBtn := detailPage.Locator("div.send-message, button[type='send'].btn-send, button.btn-send")
-	sendBtnCount, err := sendBtn.Count()
-	if err != nil {
-		return fmt.Errorf("查找发送按钮失败: %w", err)
-	}
-
-	if sendBtnCount > 0 {
-		if err := sendBtn.First().Click(); err != nil {
-			return fmt.Errorf("点击发送按钮失败: %w", err)
+	sendBtn, err := page.QuerySelector("div.send-message, button[type='send'].btn-send, button.btn-send")
+	if err == nil && sendBtn != nil {
+		sendBtn.Click()
+		utils.Sleep(1)
+		
+		// 尝试关闭小窗口
+		closeBtn, err := page.QuerySelector("i.icon-close")
+		if err == nil && closeBtn != nil {
+			closeBtn.Click()
 		}
-		time.Sleep(1 * time.Second)
-
-		// 尝试关闭可能的弹窗
-		closeBtn := detailPage.Locator("i.icon-close")
-		closeBtnCount, err := closeBtn.Count()
-		if err == nil && closeBtnCount > 0 {
-			closeBtn.First().Click()
-		}
-		return nil
 	}
-
-	return fmt.Errorf("未找到发送按钮")
 }
 
-// core/utils.go
-func (b *BossWorker) buildSearchURL(cityCode, keyword string) string {
-	baseURL := "https://www.zhipin.com/web/geek/job?"
-	params := url.Values{}
-
-	params.Add("city", cityCode)
-	params.Add("query", url.QueryEscape(keyword))
-
-	if b.config.JobType != "" {
-		params.Add("jobType", b.config.JobType)
-	}
-
-	// 添加其他搜索参数...
-	if len(b.config.Salary) > 0 {
-		params.Add("salary", strings.Join(b.config.Salary, ","))
-	}
-	if len(b.config.Experience) > 0 {
-		params.Add("experience", strings.Join(b.config.Experience, ","))
-	}
-	if len(b.config.Degree) > 0 {
-		params.Add("degree", strings.Join(b.config.Degree, ","))
-	}
-
-	return baseURL + params.Encode()
+// sendImageResume 发送图片简历
+func (b *Boss) sendImageResume(page playwright.Page) bool {
+	// 实现图片简历发送逻辑
+	// 这里需要根据实际的文件路径和页面元素来实现
+	log.Printf("发送图片简历功能待实现")
+	return false
 }
 
-// 滚动加载所有职位的函数也需要调整
-func (b *BossWorker) scrollToLoadAllJobs() error {
+// updateDeliveryStatus 更新投递状态
+func (b *Boss) updateDeliveryStatus(detailUrl string, job *utils.Job) {
+	encryptId := b.extractEncryptId(detailUrl)
+	if encryptId != "" {
+		// 这里需要根据实际的数据库操作来实现状态更新
+		log.Printf("更新投递状态 | 公司：%s | 岗位：%s | encryptId：%s", 
+			job.CompanyName, job.JobName, encryptId)
+	}
+}
+
+// extractEncryptId 从URL中提取encryptId
+func (b *Boss) extractEncryptId(detailUrl string) string {
+	key := "/job_detail/"
+	idx := strings.Index(detailUrl, key)
+	if idx < 0 {
+		return ""
+	}
+
+	start := idx + len(key)
+	end := strings.Index(detailUrl[start:], ".html")
+	if end < 0 {
+		return detailUrl[start:]
+	}
+	return detailUrl[start : start+end]
+}
+
+// scrollToLoadAllJobs 滚动加载所有岗位
+func (b *Boss) scrollToLoadAllJobs(keyword string) {
 	lastCount := -1
 	stableTries := 0
 
-	for i := 0; i < 120; i++ {
-		if b.shouldStop() {
-			return nil
+	for i := 0; i < 5000; i++ {
+		if b.shouldStopCallback != nil && b.shouldStopCallback() {
+			return
 		}
 
 		// 检查是否到达底部
-		footer := b.page.Locator("div#footer, #footer")
-		footerCount, err := footer.Count()
-		if err != nil {
-			log.Printf("查找底部元素失败: %v", err)
-			continue
-		}
-
-		if footerCount > 0 {
-			isVisible, err := footer.First().IsVisible()
-			if err == nil && isVisible {
+		footer, err := b.page.QuerySelector("div#footer, #footer")
+		if err == nil && footer != nil {
+			visible, _ := footer.IsVisible()
+			if visible {
 				break
 			}
 		}
 
 		// 滚动页面
-		if _, err := b.page.Evaluate("() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))"); err != nil {
-			log.Printf("滚动页面失败: %v", err)
-		}
+		b.page.Evaluate("() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))")
 
 		// 检查卡片数量变化
-		cards := b.page.Locator("ul.rec-job-list li.job-card-box")
-		currentCount, err := cards.Count()
+		cards, err := b.page.QuerySelectorAll("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]")
 		if err != nil {
-			log.Printf("获取卡片数量失败: %v", err)
 			continue
 		}
 
+		currentCount := len(cards)
 		if currentCount == lastCount {
 			stableTries++
 		} else {
@@ -588,296 +618,158 @@ func (b *BossWorker) scrollToLoadAllJobs() error {
 		}
 		lastCount = currentCount
 
-		// 连续无新增则强制触底
 		if stableTries >= 3 {
-			if _, err := b.page.Evaluate("() => window.scrollTo(0, document.body.scrollHeight)"); err != nil {
-				log.Printf("强制滚动到底部失败: %v", err)
-			}
+			b.page.Evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
 		}
-
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	return nil
-}
-
-func (b *BossWorker) shouldStop() bool {
-	select {
-	case <-b.stopChan:
-		return true
-	default:
-		return false
 	}
 }
 
-func (b *BossWorker) sendProgress(message string, current, total int) {
-	select {
-	case b.progressChan <- ProgressMessage{Message: message, Current: current, Total: total}:
-	default:
-		// 如果channel满了，跳过发送
+// getSearchUrl 构建搜索URL
+func (b *Boss) getSearchUrl(cityCode string) string {
+	baseUrl := "https://www.zhipin.com/web/geek/job?"
+	var params []string
+
+	if cityCode != "" && cityCode != "0" {
+		params = append(params, "city="+cityCode)
 	}
+	if b.config.JobType != "" && b.config.JobType != "0" {
+		params = append(params, "jobType="+b.config.JobType)
+	}
+	if len(b.config.Salary) > 0 && b.config.Salary[0] != "0" {
+		params = append(params, "salary="+strings.Join(b.config.Salary, ","))
+	}
+	if len(b.config.Experience) > 0 && b.config.Experience[0] != "0" {
+		params = append(params, "experience="+strings.Join(b.config.Experience, ","))
+	}
+	if len(b.config.Degree) > 0 && b.config.Degree[0] != "0" {
+		params = append(params, "degree="+strings.Join(b.config.Degree, ","))
+	}
+	if len(b.config.Scale) > 0 && b.config.Scale[0] != "0" {
+		params = append(params, "scale="+strings.Join(b.config.Scale, ","))
+	}
+	if len(b.config.Industry) > 0 && b.config.Industry[0] != "0" {
+		params = append(params, "industry="+strings.Join(b.config.Industry, ","))
+	}
+	if len(b.config.Stage) > 0 && b.config.Stage[0] != "0" {
+		params = append(params, "stage="+strings.Join(b.config.Stage, ","))
+	}
+
+	return baseUrl + strings.Join(params, "&")
 }
 
-func (b *BossWorker) Stop() {
-	close(b.stopChan)
+// getStringValue 安全获取字符串值
+func (b *Boss) getStringValue(data map[string]interface{}, key string) string {
+	if data == nil {
+		return ""
+	}
+	value, exists := data[key]
+	if !exists {
+		return ""
+	}
+	if str, ok := value.(string); ok {
+		return str
+	}
+	return ""
 }
 
-// core/chat_utils.go
-
-// 等待聊天输入框出现
-func (b *BossWorker) waitForChatInput(detailPage playwright.Page) error {
-	inputLocator := detailPage.Locator("div#chat-input.chat-input[contenteditable='true'], textarea.input-area")
-
-	for i := 0; i < 10; i++ {
-		if b.shouldStop() {
-			return fmt.Errorf("用户取消操作")
-		}
-
-		inputCount, err := inputLocator.Count()
-		if err != nil {
-			log.Printf("查找聊天输入框失败: %v", err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		if inputCount > 0 {
-			isVisible, err := inputLocator.First().IsVisible()
-			if err != nil {
-				log.Printf("检查输入框可见性失败: %v", err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			if isVisible {
-				log.Printf("聊天输入框已就绪")
-				return nil
-			}
-		}
-
-		log.Printf("等待聊天输入框出现... (%d/10)", i+1)
-		time.Sleep(1 * time.Second)
-	}
-
-	return fmt.Errorf("聊天输入框未在指定时间内出现")
-}
-
-// 发送图片简历
-func (b *BossWorker) sendImageResume(detailPage playwright.Page) bool {
-	log.Printf("开始发送图片简历...")
-
-	// 0) 检查图片文件是否存在
-	imagePath, err := b.resolveResumeImagePath()
-	if err != nil {
-		log.Printf("图片简历文件不存在: %v", err)
+// 薪资解析相关方法
+func (b *Boss) isSalaryNotExpected(salary string) bool {
+	expectedSalary := b.config.ExpectedSalary
+	if len(expectedSalary) == 0 {
 		return false
 	}
 
-	// 1) 确保在聊天页面
-	currentURL := detailPage.URL()
-
-	if !strings.Contains(currentURL, "/web/geek/chat") {
-		log.Printf("当前不在聊天页面，尝试进入聊天页面")
-		if err := b.navigateToChatPage(detailPage); err != nil {
-			log.Printf("进入聊天页面失败: %v", err)
-			return false
-		}
-	}
-
-	// 2) 查找图片发送按钮
-	imgContainer := detailPage.Locator("div.btn-sendimg[aria-label='发送图片'], div[aria-label='发送图片'].btn-sendimg")
-	imgContainerCount, err := imgContainer.Count()
-	if err != nil {
-		log.Printf("查找图片发送容器失败: %v", err)
-		return false
-	}
-
-	if imgContainerCount == 0 {
-		log.Printf("未找到图片发送按钮")
-		return false
-	}
-
-	// 3) 查找文件输入框
-	imageInput := imgContainer.Locator("input[type='file'][accept*='image']").First()
-	imageInputCount, err := imageInput.Count()
-	if err != nil {
-		log.Printf("查找图片输入框失败: %v", err)
-		return false
-	}
-
-	// 4) 如果文件输入框不存在，尝试点击触发
-	if imageInputCount == 0 {
-		log.Printf("图片输入框不存在，尝试点击触发")
-		if err := b.triggerImageInput(detailPage, imgContainer, imagePath); err != nil {
-			log.Printf("触发图片输入失败: %v", err)
-			return false
-		}
+	// 清理薪资文本
+	salary = b.removeYearBonusText(salary)
+	if !b.isSalaryInExpectedFormat(salary) {
 		return true
 	}
 
-	// 5) 直接设置文件
-	log.Printf("找到图片输入框，直接上传图片")
-	if err := imageInput.SetInputFiles([]string{imagePath}); err != nil {
-		log.Printf("上传图片失败: %v", err)
-		return false
-	}
+	salary = b.cleanSalaryText(salary)
+	jobType := b.detectJobType(salary)
+	salary = b.removeDayUnitIfNeeded(salary)
 
-	log.Printf("图片简历发送成功")
-	time.Sleep(2 * time.Second) // 等待上传完成
-	return true
+	jobSalaryRange := b.parseSalaryRange(salary)
+	return b.isSalaryOutOfRange(jobSalaryRange, expectedSalary, jobType)
 }
 
-// 解析图片简历路径
-func (b *BossWorker) resolveResumeImagePath() (string, error) {
-	// 优先检查当前目录下的 resume.jpg
-	possiblePaths := []string{
-		"./resume.jpg",
-		"./resources/resume.jpg",
-		"./static/resume.jpg",
-		"./images/resume.jpg",
-	}
-
-	for _, path := range possiblePaths {
-		if _, err := os.Stat(path); err == nil {
-			absPath, err := filepath.Abs(path)
-			if err != nil {
-				continue
-			}
-			log.Printf("找到图片简历: %s", absPath)
-			return absPath, nil
-		}
-	}
-
-	// 如果本地文件不存在，检查是否在二进制文件同目录
-	exePath, err := os.Executable()
-	if err == nil {
-		exeDir := filepath.Dir(exePath)
-		exeResumePath := filepath.Join(exeDir, "resume.jpg")
-		if _, err := os.Stat(exeResumePath); err == nil {
-			log.Printf("找到图片简历: %s", exeResumePath)
-			return exeResumePath, nil
-		}
-	}
-
-	return "", fmt.Errorf("未找到 resume.jpg 图片文件，请将图片放置在程序同目录下")
+func (b *Boss) removeYearBonusText(salary string) string {
+	re := regexp.MustCompile(`·\d+薪`)
+	return re.ReplaceAllString(salary, "")
 }
 
-// 导航到聊天页面
-func (b *BossWorker) navigateToChatPage(detailPage playwright.Page) error {
-	chatBtn := detailPage.Locator("a.btn-startchat, a.op-btn-chat")
-	chatBtnCount, err := chatBtn.Count()
-	if err != nil {
-		return fmt.Errorf("查找聊天按钮失败: %w", err)
-	}
-
-	if chatBtnCount == 0 {
-		return fmt.Errorf("未找到聊天按钮")
-	}
-
-	if err := chatBtn.First().Click(); err != nil {
-		return fmt.Errorf("点击聊天按钮失败: %w", err)
-	}
-
-	// 等待页面跳转到聊天页面
-	_, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	err = detailPage.WaitForURL("**/web/geek/chat**", playwright.PageWaitForURLOptions{
-		Timeout: playwright.Float(15000),
-	})
-	if err != nil {
-		return fmt.Errorf("等待跳转到聊天页面超时: %w", err)
-	}
-
-	log.Printf("成功进入聊天页面")
-	return nil
+func (b *Boss) isSalaryInExpectedFormat(salary string) bool {
+	return strings.Contains(salary, "K") || strings.Contains(salary, "k") || strings.Contains(salary, "元/天")
 }
 
-// 触发图片输入（处理文件选择器）
-func (b *BossWorker) triggerImageInput(detailPage playwright.Page, imgContainer playwright.Locator, imagePath string) error {
-	// 设置文件选择器监听
-	fileChooserChan := make(chan playwright.FileChooser, 1)
-	detailPage.OnFileChooser(func(chooser playwright.FileChooser) {
-		select {
-		case fileChooserChan <- chooser:
-		default:
-		}
-	})
-
-	// 点击图片按钮
-	if err := imgContainer.First().Click(); err != nil {
-		return fmt.Errorf("点击图片按钮失败: %w", err)
+func (b *Boss) cleanSalaryText(salary string) string {
+	salary = strings.ReplaceAll(salary, "K", "")
+	salary = strings.ReplaceAll(salary, "k", "")
+	if idx := strings.Index(salary, "·"); idx != -1 {
+		salary = salary[:idx]
 	}
-
-	// 等待文件选择器出现
-	select {
-	case chooser := <-fileChooserChan:
-		log.Printf("检测到文件选择器，直接设置文件")
-		if err := chooser.SetFiles([]string{imagePath}); err != nil {
-			return fmt.Errorf("设置文件失败: %w", err)
-		}
-		log.Printf("通过文件选择器上传图片成功")
-		return nil
-
-	case <-time.After(3 * time.Second):
-		log.Printf("未检测到文件选择器，尝试查找输入框")
-		// 重新查找输入框
-		imageInput := imgContainer.Locator("input[type='file'][accept*='image']").First()
-		imageInputCount, err := imageInput.Count()
-		if err != nil {
-			return fmt.Errorf("重新查找输入框失败: %w", err)
-		}
-
-		if imageInputCount > 0 {
-			if err := imageInput.SetInputFiles([]string{imagePath}); err != nil {
-				return fmt.Errorf("上传图片失败: %w", err)
-			}
-			log.Printf("通过输入框上传图片成功")
-			return nil
-		}
-
-		return fmt.Errorf("无法找到图片上传方式")
-	}
+	return salary
 }
 
-// 在 resumeSubmission 函数中补充调用
-func (b *BossWorker) resumeSubmission(ctx context.Context, job *JobDetail, keyword string) error {
-	if b.config.Debugger {
-		log.Printf("调试模式：仅遍历岗位，不投递 | 公司：%s | 岗位：%s",
-			job.CompanyName, job.JobName)
-		return nil
+func (b *Boss) detectJobType(salary string) string {
+	if strings.Contains(salary, "元/天") {
+		return "day"
+	}
+	return "month"
+}
+
+func (b *Boss) removeDayUnitIfNeeded(salary string) string {
+	return strings.ReplaceAll(salary, "元/天", "")
+}
+
+func (b *Boss) parseSalaryRange(salary string) []int {
+	parts := strings.Split(salary, "-")
+	var result []int
+
+	for _, part := range parts {
+		// 移除非数字字符
+		re := regexp.MustCompile(`[^0-9]`)
+		cleanPart := re.ReplaceAllString(part, "")
+		if num, err := strconv.Atoi(cleanPart); err == nil {
+			result = append(result, num)
+		}
 	}
 
-	// 1. 打开详情页
-	detailPage, detailURL, err := b.openJobDetailPage()
-	if err != nil {
-		return fmt.Errorf("打开详情页失败: %w DetailURL: %s", err, detailURL)
-	}
-	defer detailPage.Close()
+	return result
+}
 
-	// 2. 点击立即沟通按钮
-	if err := b.clickChatButton(detailPage); err != nil {
-		return fmt.Errorf("点击沟通按钮失败: %w", err)
+func (b *Boss) isSalaryOutOfRange(jobSalary []int, expectedSalary []int, jobType string) bool {
+	if len(jobSalary) < 2 {
+		return true
 	}
 
-	// 3. 等待聊天输入框（新增调用）
-	if err := b.waitForChatInput(detailPage); err != nil {
-		return fmt.Errorf("等待聊天输入框失败: %w", err)
+	minExpected := expectedSalary[0]
+	var maxExpected int
+	if len(expectedSalary) > 1 {
+		maxExpected = expectedSalary[1]
+	} else {
+		maxExpected = minExpected
 	}
 
-	// 4. 生成并发送招呼语
-	message := b.generateGreetingMessage(keyword, job)
-	if err := b.sendChatMessage(detailPage, message); err != nil {
-		return fmt.Errorf("发送招呼语失败: %w", err)
+	if jobType == "day" {
+		// 转换日薪为月薪进行比较
+		minExpected = b.convertDailyToMonthly(minExpected)
+		maxExpected = b.convertDailyToMonthly(maxExpected)
 	}
 
-	// 5. 发送图片简历（可选，新增调用）
-	var imgResumeSent bool
-	if b.config.SendImgResume {
-		imgResumeSent = b.sendImageResume(detailPage)
+	// 如果职位薪资下限低于期望的最低薪资，返回不符合
+	if jobSalary[1] < minExpected {
+		return true
 	}
 
-	log.Printf("投递完成 | 公司：%s | 岗位：%s | 薪资：%s | 招呼语：%s | 图片简历：%v",
-		job.CompanyName, job.JobName, job.Salary, message, imgResumeSent)
+	// 如果职位薪资上限高于期望的最高薪资，返回不符合
+	return len(expectedSalary) > 1 && jobSalary[0] > maxExpected
+}
 
-	return nil
+func (b *Boss) convertDailyToMonthly(dailySalary int) int {
+	// 按21.75个工作日计算
+	daily := big.NewFloat(float64(dailySalary))
+	monthly := new(big.Float).Mul(daily, big.NewFloat(21.75))
+	result, _ := monthly.Int64()
+	return int(result)
 }

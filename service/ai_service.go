@@ -21,11 +21,11 @@ type ConfigProvider interface {
 // AiService AI服务
 type AiService struct {
 	aiRepo        repository.AiRepository
-	configService ConfigProvider
+	configService  ConfigService
 	httpClient    *http.Client
 }
 
-func NewAiService(aiRepo repository.AiRepository, configService ConfigProvider) *AiService {
+func NewAiService(aiRepo repository.AiRepository, configService ConfigService) *AiService {
 	return &AiService{
 		aiRepo:     aiRepo,
 		configService: configService,
@@ -71,7 +71,7 @@ type aiUsage struct {
 // SendRequest 发送AI请求并返回回复内容
 func (s *AiService) SendRequest(content string) (string, error) {
 	// 读取并校验配置
-	cfg := s.configService.GetAiConfigs()
+	cfg,_ := s.configService.GetAiConfigs()
 	baseUrl := cfg["BASE_URL"]
 	apiKey := cfg["API_KEY"]
 	model := cfg["MODEL"]
@@ -215,7 +215,8 @@ func (s *AiService) handleErrorResponse(body []byte, endpoint, content, apiKey, 
 	// 检查是否需要重试到Responses API
 	if !strings.HasSuffix(endpoint, "/responses") && s.containsReasoningParamError(bodyStr) {
 		log.Printf("检测到 reasoning 相关参数错误，自动切换到 Responses API 重试")
-		fallbackEndpoint := s.buildResponsesEndpoint(s.normalizeBaseUrl(s.configService.GetAiConfigs()["BASE_URL"]))
+		cfg,_ := s.configService.GetAiConfigs()
+		fallbackEndpoint := s.buildResponsesEndpoint(s.normalizeBaseUrl(cfg["BASE_URL"]))
 		return s.sendRequestViaResponses(content, apiKey, model, fallbackEndpoint)
 	}
 
