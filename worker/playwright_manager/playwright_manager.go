@@ -68,6 +68,11 @@ func (pm *PlaywrightManager) Init() error {
 	log.Println("  初始化浏览器自动化引擎")
 	log.Println("========================================")
 
+	// 首先检查并安装 Playwright 驱动
+	if err := playwright.Install(); err != nil {
+		return fmt.Errorf("安装Playwright驱动失败: %v", err)
+	}
+
 	// 启动 Playwright
 	pw, err := playwright.Run()
 	if err != nil {

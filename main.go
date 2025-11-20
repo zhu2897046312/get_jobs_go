@@ -18,7 +18,7 @@ import (
 	"get_jobs_go/worker/boss"
 	"get_jobs_go/worker/playwright_manager"
 
-	"gorm.io/driver/sqlite"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -59,14 +59,29 @@ func NewApplication() *Application {
 func (app *Application) InitDatabase() error {
 	log.Println("初始化数据库连接...")
 
-	// 使用SQLite数据库，你可以根据需要修改为其他数据库
-	db, err := gorm.Open(sqlite.Open("jobs.db"), &gorm.Config{})
+	// MySQL 连接配置
+	// 格式: "user:password@tcp(host:port)/dbname?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := "root:123@tcp(localhost:3306)/jobs?charset=utf8mb4&parseTime=True&loc=Local"
+
+	// 使用 MySQL 数据库
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return fmt.Errorf("数据库连接失败: %v", err)
 	}
 
+	// 获取底层的 SQL DB 对象以设置连接池
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("获取数据库连接失败: %v", err)
+	}
+
+	// 设置连接池参数
+	sqlDB.SetMaxIdleConns(10)           // 最大空闲连接数
+	sqlDB.SetMaxOpenConns(100)          // 最大打开连接数
+	sqlDB.SetConnMaxLifetime(time.Hour) // 连接的最大可复用时间
+
 	app.db = db
-	log.Println("✓ 数据库连接成功")
+	log.Println("✓ MySQL 数据库连接成功")
 
 	// 自动迁移表结构（如果需要）
 	// 这里需要根据你的实体结构添加自动迁移

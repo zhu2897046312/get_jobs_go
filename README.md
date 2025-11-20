@@ -19,3 +19,5 @@
 # worker
 
 ## boss_worker 服务层 依赖 boss_service层 ai_service层 model层 config层 uitls层
+
+# playwright安装路径 2025/11/20 20:02:51 INFO Downloading driver path=C:\Users\28970\AppData\Local\ms-playwright-go\1.52.0
