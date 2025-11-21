@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"get_jobs_go/model"
 	"get_jobs_go/repository"
 	"get_jobs_go/service"
 	"get_jobs_go/worker/boss"
@@ -60,10 +61,16 @@ func (app *Application) InitDatabase() error {
 
 	// 自动迁移数据库表
 	if err := db.AutoMigrate(
-	// 这里应该添加需要迁移的模型
-	// &model.Config{},
-	// &model.Cookie{},
-	// ... 其他模型
+		// 这里应该添加需要迁移的模型
+		&model.AiEntity{},
+		&model.BlacklistEntity{},
+		&model.BossConfigEntity{},
+		&model.BossIndustryEntity{},
+		&model.BossJobDataEntity{},
+		&model.BossOptionEntity{},
+		&model.ConfigEntity{},
+		&model.CookieEntity{},
+		&model.Job{},
 	); err != nil {
 		return fmt.Errorf("数据库迁移失败: %v", err)
 	}
@@ -119,7 +126,6 @@ func (app *Application) InitServices() error {
 	// 初始化Playwright管理器
 	playwrightManager := playwright_manager.NewPlaywrightManager(
 		*cookieService,
-		configService,
 	)
 	app.playwrightManager = playwrightManager
 
@@ -149,20 +155,17 @@ func (app *Application) Start() error {
 	// 启动Boss直聘任务服务
 	if app.bossJobService != nil {
 		log.Println("启动Boss直聘数据采集任务...")
-		go func() {
-			// 使用默认的进度回调函数
-			progressCallback := func(message boss.JobProgressMessage) {
-
-				log.Printf("[%s][%s] %s", message.Platform, message.Type, message.Message)
-				if message.Current != nil && message.Total != nil {
-					log.Printf("进度: %d/%d", *message.Current, *message.Total)
-				}
+		// 使用默认的进度回调函数
+		progressCallback := func(message boss.JobProgressMessage) {
+			log.Printf("[%s][%s] %s", message.Platform, message.Type, message.Message)
+			if message.Current != nil && message.Total != nil {
+				log.Printf("进度: %d/%d", *message.Current, *message.Total)
 			}
+		}
 
-			if err := app.bossJobService.ExecuteDelivery(progressCallback); err != nil {
-				log.Printf("Boss直聘任务执行失败: %v", err)
-			}
-		}()
+		if err := app.bossJobService.ExecuteDelivery(progressCallback); err != nil {
+			log.Printf("Boss直聘任务执行失败: %v", err)
+		}
 	} else {
 		log.Println("⚠️ Boss直聘任务服务未初始化")
 	}

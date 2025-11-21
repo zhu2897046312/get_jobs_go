@@ -56,7 +56,9 @@ func NewBossJobService(
 	}
 }
 
-// ExecuteDelivery 执行投递任务
+// =============================
+// ExecuteDelivery：核心任务执行逻辑（带登录等待 Loop）
+// =============================
 func (s *BossJobService) ExecuteDelivery(progressCallback func(message JobProgressMessage)) error {
 	s.statusMutex.Lock()
 	if s.running {
@@ -80,7 +82,9 @@ func (s *BossJobService) ExecuteDelivery(progressCallback func(message JobProgre
 		s.statusMutex.Unlock()
 	}()
 
-	// 获取Boss页面实例
+	// =============================
+	// ① 获取Boss页面
+	// =============================
 	page := s.playwrightManager.GetBossPage()
 	if page == nil {
 		progressCallback(JobProgressMessage{
@@ -92,22 +96,75 @@ func (s *BossJobService) ExecuteDelivery(progressCallback func(message JobProgre
 		return nil
 	}
 
-	// 检查登录状态
+	// =============================
+	// ② 登录检测与等待登录 Loop
+	// =============================
 	if !s.playwrightManager.IsLoggedIn(s.platform) {
 		progressCallback(JobProgressMessage{
 			Platform:  s.platform,
-			Type:      "error",
-			Message:   "请先登录Boss直聘",
+			Type:      "info",
+			Message:   "检测到未登录，正在引导到登录页，请扫描二维码登录...",
 			Timestamp: time.Now().UnixMilli(),
 		})
-		return nil
+
+		// 确保 PlaywrightManager 会在未登录时引导登录页
+		s.playwrightManager.SetLoginStatus(s.platform, false)
+
+		// 等待 Playwright 自动引导至二维码页面并完成登录（由 PM 的后台 loop 更新状态）
+		timeout := time.After(3 * time.Minute) // 三分钟超时
+		ticker := time.NewTicker(600 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-timeout:
+				progressCallback(JobProgressMessage{
+					Platform:  s.platform,
+					Type:      "error",
+					Message:   "登录超时，请重新开始任务",
+					Timestamp: time.Now().UnixMilli(),
+				})
+				return nil
+
+			case <-ticker.C:
+				// 优先检查 shouldStop，以便能及时中断等待
+				s.statusMutex.RLock()
+				if s.shouldStop {
+					s.statusMutex.RUnlock()
+					progressCallback(JobProgressMessage{
+						Platform:  s.platform,
+						Type:      "warning",
+						Message:   "任务已被停止，停止等待登录",
+						Timestamp: time.Now().UnixMilli(),
+					})
+					return nil
+				}
+				s.statusMutex.RUnlock()
+
+				if s.playwrightManager.IsLoggedIn(s.platform) {
+					progressCallback(JobProgressMessage{
+						Platform:  s.platform,
+						Type:      "success",
+						Message:   "登录成功，继续执行任务...",
+						Timestamp: time.Now().UnixMilli(),
+					})
+					goto LOGIN_DONE
+				}
+			}
+		}
 	}
 
-	// 暂停后台监控
+LOGIN_DONE:
+
+	// =============================
+	// ③ 暂停后台监控（避免冲突）
+	// =============================
 	s.playwrightManager.PauseBossMonitoring()
 	defer s.playwrightManager.ResumeBossMonitoring()
 
-	// 加载配置
+	// =============================
+	// ④ 加载配置
+	// =============================
 	bossConfig, err := s.configService.GetBossConfig()
 	if err != nil {
 		progressCallback(JobProgressMessage{
@@ -133,7 +190,9 @@ func (s *BossJobService) ExecuteDelivery(progressCallback func(message JobProgre
 		Timestamp: time.Now().UnixMilli(),
 	})
 
-	// 创建Boss实例并执行投递
+	// =============================
+	// ⑤ 创建 Boss 实例
+	// =============================
 	bossInstance := s.bossProvider()
 	bossInstance.SetPage(page)
 	bossInstance.SetConfig(bossConfig)
@@ -169,7 +228,9 @@ func (s *BossJobService) ExecuteDelivery(progressCallback func(message JobProgre
 		return s.shouldStop
 	})
 
-	// 准备阶段
+	// =============================
+	// ⑥ 准备阶段
+	// =============================
 	if err := bossInstance.Prepare(); err != nil {
 		progressCallback(JobProgressMessage{
 			Platform:  s.platform,
@@ -180,7 +241,9 @@ func (s *BossJobService) ExecuteDelivery(progressCallback func(message JobProgre
 		return err
 	}
 
-	// 执行投递
+	// =============================
+	// ⑦ 执行投递
+	// =============================
 	deliveredCount := bossInstance.Execute()
 
 	progressCallback(JobProgressMessage{
