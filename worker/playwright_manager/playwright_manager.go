@@ -255,9 +255,9 @@ func (pm *PlaywrightManager) setupBossLoginMonitoring() {
 	// 监听页面导航事件
 	pm.bossPage.On("framenavigated", func(frame playwright.Frame) {
 		if frame == pm.bossPage.MainFrame() {
-			// 使用原子操作检查暂停状态，避免锁竞争
+			// 使用原子操作检查暂停状态，原子操作不会阻塞
 			if !pm.IsBossMonitoringPaused() {
-				go pm.checkBossLoginStatus() // 使用goroutine避免阻塞事件循环
+				pm.checkBossLoginStatus() // 直接调用，无需goroutine
 			}
 		}
 	})
@@ -339,7 +339,7 @@ func (pm *PlaywrightManager) SetLoginStatus(platform string, isLoggedIn bool) {
 
 		// Boss平台：在设置未登录状态时，引导到登录页
 		if platform == "boss" && !isLoggedIn {
-			// 先释放锁，再启动goroutine
+			// 使用goroutine避免阻塞状态设置
 			go func() {
 				if err := pm.guideBossToLogin(); err != nil {
 					log.Printf("引导Boss登录失败: %v", err)
@@ -455,8 +455,8 @@ func (pm *PlaywrightManager) RemoveLoginStatusListener(listenerID string) {
 func (pm *PlaywrightManager) notifyLoginStatusListeners(change LoginStatusChange) {
 	pm.loginStatusListeners.Range(func(key, value interface{}) bool {
 		if listener, ok := value.(LoginStatusListener); ok {
-			// 使用goroutine避免阻塞
-			go func(l LoginStatusListener) {
+			// 直接调用，无需goroutine
+			func(l LoginStatusListener) {
 				defer func() {
 					if r := recover(); r != nil {
 						log.Printf("通知登录状态监听器失败: %v", r)
@@ -558,8 +558,8 @@ func (pm *PlaywrightManager) scheduledLoginCheck() {
 	}
 
 	log.Printf("定时检查Boss登录状态...")
-	// 使用goroutine避免阻塞定时器
-	go pm.checkBossLoginStatus()
+	// 直接调用，无需goroutine
+	pm.checkBossLoginStatus()
 }
 
 // Close 关闭Playwright实例
