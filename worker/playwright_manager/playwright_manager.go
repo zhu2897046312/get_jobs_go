@@ -114,7 +114,7 @@ func (pm *PlaywrightManager) Init() error {
 	pm.context.SetDefaultTimeout(float64(pm.defaultTimeout.Milliseconds()))
 
 	// 创建Boss直聘页面
-	log.Println("开始创建所有平台的Page...")
+	log.Println("开始创建Boss直聘Page...")
 	pm.bossPage, err = pm.context.NewPage()
 	if err != nil {
 		return fmt.Errorf("创建Boss Page失败: %w", err)
@@ -216,11 +216,10 @@ func (pm *PlaywrightManager) setupBossPlatform() error {
 
 // checkIfBossLoggedIn 检查Boss是否已登录
 func (pm *PlaywrightManager) checkIfBossLoggedIn() (bool, error) {
-	// 优先检测明显的登录特征：用户头像或用户名
-	// 这里尽量不去主动点击元素来判断登录状态，以免造成误判
-
+	// 更稳健的登录判断：优先检测用户头像/昵称是否可见；备用检测登录入口是否可见且包含"登录"文本
+	
 	// 1) 用户名/昵称元素
-	userName := pm.bossPage.Locator(".user-name, li.nav-figure span.label-text").First()
+	userName := pm.bossPage.Locator("li.nav-figure span.label-text").First()
 	if err := userName.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(2000)}); err == nil {
 		visible, err := userName.IsVisible()
 		if err == nil && visible {
@@ -229,7 +228,7 @@ func (pm *PlaywrightManager) checkIfBossLoggedIn() (bool, error) {
 	}
 
 	// 2) 头像 img
-	avatar := pm.bossPage.Locator("li.nav-figure img").First()
+	avatar := pm.bossPage.Locator("li.nav-figure").First()
 	if err := avatar.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(2000)}); err == nil {
 		visible, err := avatar.IsVisible()
 		if err == nil && visible {
@@ -242,12 +241,15 @@ func (pm *PlaywrightManager) checkIfBossLoggedIn() (bool, error) {
 	if err := loginAnchor.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(2000)}); err == nil {
 		visible, err := loginAnchor.IsVisible()
 		if err == nil && visible {
-			// 未登录（有登录入口）
-			return false, nil
+			// 检查文本内容是否包含"登录"
+			text, err := loginAnchor.TextContent()
+			if err == nil && strings.Contains(text, "登录") {
+				return false, nil
+			}
 		}
 	}
 
-	// 无法明确检测到登录特征时，返回未登录（更保守）
+	// 无法明确检测到登录特征时，保守返回未登录
 	return false, nil
 }
 
@@ -332,13 +334,18 @@ func (pm *PlaywrightManager) SetLoginStatus(platform string, isLoggedIn bool) {
 	pm.loginStatusMutex.Lock()
 	defer pm.loginStatusMutex.Unlock()
 
-	previousStatus := pm.loginStatus[platform]
-	if previousStatus != isLoggedIn {
+	previousStatus, exists := pm.loginStatus[platform]
+	if !exists || previousStatus != isLoggedIn {
 		pm.loginStatus[platform] = isLoggedIn
 
 		// Boss平台：在设置未登录状态时，引导到登录页
 		if platform == "boss" && !isLoggedIn {
-			pm.guideBossToLogin()
+			// 使用goroutine异步执行登录引导，避免阻塞主线程
+			go func() {
+				if err := pm.guideBossToLogin(); err != nil {
+					log.Printf("引导Boss登录失败: %v", err)
+				}
+			}()
 		}
 
 		// 通知监听器
@@ -351,44 +358,49 @@ func (pm *PlaywrightManager) SetLoginStatus(platform string, isLoggedIn bool) {
 	}
 }
 
-// guideBossToLogin 引导Boss到登录页
-func (pm *PlaywrightManager) guideBossToLogin() {
+// guideBossToLogin 引导Boss到登录页（返回错误信息）
+func (pm *PlaywrightManager) guideBossToLogin() error {
 	if pm.bossPage == nil {
-		return
+		return fmt.Errorf("Boss页面未初始化")
 	}
 
 	currentURL := pm.bossPage.URL()
 	if currentURL == "" {
-		log.Printf("获取当前URL失败")
-		return
+		return fmt.Errorf("获取当前URL失败")
 	}
 
-	// 避免重复导航
+	// 避免重复导航：若当前已在登录页则不再二次跳转
 	if !strings.Contains(currentURL, "/web/user/") {
+		log.Println("检测到未登录Boss，正在引导到登录页...")
+		
 		_, err := pm.bossPage.Goto(pm.bossURL+"/web/user/?ka=header-login", playwright.PageGotoOptions{
 			Timeout: playwright.Float(60000),
 		})
 		if err != nil {
-			log.Printf("导航到Boss登录页失败: %v", err)
-			return
+			return fmt.Errorf("导航到Boss登录页失败: %w", err)
 		}
 		time.Sleep(800 * time.Millisecond)
 	}
 
 	// 尝试切换到二维码登录
 	pm.switchToBossQRLogin()
+	return nil
 }
 
-// switchToBossQRLogin 切换到Boss二维码登录
+// switchToBossQRLogin 切换到Boss二维码登录（增强版）
 func (pm *PlaywrightManager) switchToBossQRLogin() {
+	log.Println("尝试切换到Boss二维码登录...")
+	
+	// 给页面一些时间加载
+	time.Sleep(1 * time.Second)
+
 	// 优先使用新版选择器
 	qrSwitch := pm.bossPage.Locator(".btn-sign-switch.ewm-switch").First()
-	// 尝试等待元素出现，超时会返回错误
-	if err := qrSwitch.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(3000)}); err == nil {
+	if err := qrSwitch.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(5000)}); err == nil {
 		visible, err := qrSwitch.IsVisible()
 		if err == nil && visible {
 			if err := qrSwitch.Click(); err == nil {
-				log.Println("已点击包含文本的二维码登录切换提示（APP扫码登录）")
+				log.Println("✓ 已切换到Boss二维码登录页面")
 				return
 			}
 		}
@@ -396,11 +408,11 @@ func (pm *PlaywrightManager) switchToBossQRLogin() {
 
 	// 兜底：按文本匹配
 	tip := pm.bossPage.Locator("text=APP扫码登录").First()
-	if err := tip.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(3000)}); err == nil {
+	if err := tip.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(5000)}); err == nil {
 		visible, err := tip.IsVisible()
 		if err == nil && visible {
 			if err := tip.Click(); err == nil {
-				log.Println("已点击包含文本的二维码登录切换提示（APP扫码登录）")
+				log.Println("✓ 已通过文本匹配切换到Boss二维码登录")
 				return
 			}
 		}
@@ -408,17 +420,24 @@ func (pm *PlaywrightManager) switchToBossQRLogin() {
 
 	// 兼容旧版选择器
 	legacy := pm.bossPage.Locator("li.sign-switch-tip").First()
-	if err := legacy.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(3000)}); err == nil {
+	if err := legacy.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(5000)}); err == nil {
 		visible, err := legacy.IsVisible()
 		if err == nil && visible {
 			if err := legacy.Click(); err == nil {
-				log.Println("已点击包含文本的二维码登录切换提示（APP扫码登录）")
+				log.Println("✓ 已通过旧版选择器切换到Boss二维码登录")
 				return
 			}
 		}
 	}
 
-	log.Println("未找到二维码登录切换按钮，保持当前登录页")
+	// 最终兜底：直接检查是否已经在二维码页面
+	currentURL := pm.bossPage.URL()
+	if strings.Contains(currentURL, "/web/user/") {
+		log.Println("✓ 已在Boss登录页面，等待用户扫码...")
+		return
+	}
+
+	log.Println("⚠ 未找到二维码登录切换按钮，但已导航到登录页")
 }
 
 // AddLoginStatusListener 注册登录状态监听器
