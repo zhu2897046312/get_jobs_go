@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/playwright-community/playwright-go"
@@ -30,15 +31,13 @@ type PlaywrightManager struct {
 	context    playwright.BrowserContext
 	bossPage   playwright.Page
 
-	// 登录状态追踪
-	loginStatus          map[string]bool
-	loginStatusMutex     sync.RWMutex
-	loginStatusListeners []LoginStatusListener
-	listenersMutex       sync.RWMutex
+	// 使用线程安全的容器
+	loginStatus          sync.Map // platform -> bool
+	listenerIDCounter    int32
+	loginStatusListeners sync.Map // listenerID -> LoginStatusListener
 
-	// 监控控制
-	bossMonitoringPaused bool
-	bossMonitoringMutex  sync.RWMutex
+	// 使用原子操作替代锁
+	bossMonitoringPaused int32 // 0=运行, 1=暂停
 
 	// 定时检查的可取消上下文
 	monitoringCtx    context.Context
@@ -58,12 +57,10 @@ type PlaywrightManager struct {
 // NewPlaywrightManager 创建新的Playwright管理器
 func NewPlaywrightManager(cookieService service.CookieService) *PlaywrightManager {
 	return &PlaywrightManager{
-		loginStatus:          make(map[string]bool),
-		loginStatusListeners: make([]LoginStatusListener, 0),
-		defaultTimeout:       30 * time.Second,
-		cdpPort:              7866,
-		bossURL:              "https://www.zhipin.com",
-		cookieService:        cookieService,
+		defaultTimeout: 30 * time.Second,
+		cdpPort:        7866,
+		bossURL:        "https://www.zhipin.com",
+		cookieService:  cookieService,
 	}
 }
 
@@ -253,17 +250,14 @@ func (pm *PlaywrightManager) checkIfBossLoggedIn() (bool, error) {
 	return false, nil
 }
 
-// setupBossLoginMonitoring 设置Boss登录状态监控
+// setupBossLoginMonitoring 设置Boss登录状态监控（修复版）
 func (pm *PlaywrightManager) setupBossLoginMonitoring() {
 	// 监听页面导航事件
 	pm.bossPage.On("framenavigated", func(frame playwright.Frame) {
 		if frame == pm.bossPage.MainFrame() {
-			pm.bossMonitoringMutex.RLock()
-			paused := pm.bossMonitoringPaused
-			pm.bossMonitoringMutex.RUnlock()
-
-			if !paused {
-				pm.checkBossLoginStatus()
+			// 使用原子操作检查暂停状态，避免锁竞争
+			if !pm.IsBossMonitoringPaused() {
+				go pm.checkBossLoginStatus() // 使用goroutine避免阻塞事件循环
 			}
 		}
 	})
@@ -280,11 +274,16 @@ func (pm *PlaywrightManager) checkBossLoginStatus() {
 	}
 
 	previousStatus := pm.IsLoggedIn("boss")
+	log.Printf("Boss登录状态检查结果: 当前=%v, 之前=%v", isLoggedIn, previousStatus)
+	
 	if isLoggedIn && !previousStatus {
+		log.Println("检测到Boss从未登录变为已登录状态")
 		pm.onBossLoginSuccess()
 	} else if !isLoggedIn && previousStatus {
-		// 登录被检测为失效：更新状态并引导登录
+		log.Println("检测到Boss从已登录变为未登录状态")
 		pm.SetLoginStatus("boss", false)
+	} else {
+		log.Printf("Boss登录状态未发生变化: %v", isLoggedIn)
 	}
 }
 
@@ -329,18 +328,18 @@ func (pm *PlaywrightManager) parseCookiesFromString(cookieJSON string) ([]playwr
 	return cookies, nil
 }
 
-// SetLoginStatus 手动设置平台登录状态
+// SetLoginStatus 设置平台登录状态（线程安全）
 func (pm *PlaywrightManager) SetLoginStatus(platform string, isLoggedIn bool) {
-	pm.loginStatusMutex.Lock()
-	defer pm.loginStatusMutex.Unlock()
-
-	previousStatus, exists := pm.loginStatus[platform]
-	if !exists || previousStatus != isLoggedIn {
-		pm.loginStatus[platform] = isLoggedIn
+	// 获取旧状态
+	oldStatus, loaded := pm.loginStatus.LoadOrStore(platform, false)
+	
+	// 只有状态变化时才更新
+	if !loaded || oldStatus.(bool) != isLoggedIn {
+		pm.loginStatus.Store(platform, isLoggedIn)
 
 		// Boss平台：在设置未登录状态时，引导到登录页
 		if platform == "boss" && !isLoggedIn {
-			// 使用goroutine异步执行登录引导，避免阻塞主线程
+			// 先释放锁，再启动goroutine
 			go func() {
 				if err := pm.guideBossToLogin(); err != nil {
 					log.Printf("引导Boss登录失败: %v", err)
@@ -440,49 +439,42 @@ func (pm *PlaywrightManager) switchToBossQRLogin() {
 	log.Println("⚠ 未找到二维码登录切换按钮，但已导航到登录页")
 }
 
-// AddLoginStatusListener 注册登录状态监听器
-func (pm *PlaywrightManager) AddLoginStatusListener(listener LoginStatusListener) {
-	pm.listenersMutex.Lock()
-	defer pm.listenersMutex.Unlock()
-	pm.loginStatusListeners = append(pm.loginStatusListeners, listener)
+// AddLoginStatusListener 注册登录状态监听器（线程安全）
+func (pm *PlaywrightManager) AddLoginStatusListener(listener LoginStatusListener) string {
+	listenerID := fmt.Sprintf("listener_%d", atomic.AddInt32(&pm.listenerIDCounter, 1))
+	pm.loginStatusListeners.Store(listenerID, listener)
+	return listenerID
 }
 
-// RemoveLoginStatusListener 移除登录状态监听器
-func (pm *PlaywrightManager) RemoveLoginStatusListener(listener LoginStatusListener) {
-	pm.listenersMutex.Lock()
-	defer pm.listenersMutex.Unlock()
-
-	for i, l := range pm.loginStatusListeners {
-		// 通过函数指针比较不是可靠方法，但保留原有逻辑
-		if &l == &listener {
-			pm.loginStatusListeners = append(pm.loginStatusListeners[:i], pm.loginStatusListeners[i+1:]...)
-			break
-		}
-	}
+// RemoveLoginStatusListener 移除登录状态监听器（线程安全）
+func (pm *PlaywrightManager) RemoveLoginStatusListener(listenerID string) {
+	pm.loginStatusListeners.Delete(listenerID)
 }
 
-// notifyLoginStatusListeners 通知登录状态监听器
+// notifyLoginStatusListeners 通知登录状态监听器（线程安全）
 func (pm *PlaywrightManager) notifyLoginStatusListeners(change LoginStatusChange) {
-	pm.listenersMutex.RLock()
-	defer pm.listenersMutex.RUnlock()
-
-	for _, listener := range pm.loginStatusListeners {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("通知登录状态监听器失败: %v", r)
-				}
-			}()
-			listener(change)
-		}()
-	}
+	pm.loginStatusListeners.Range(func(key, value interface{}) bool {
+		if listener, ok := value.(LoginStatusListener); ok {
+			// 使用goroutine避免阻塞
+			go func(l LoginStatusListener) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("通知登录状态监听器失败: %v", r)
+					}
+				}()
+				l(change)
+			}(listener)
+		}
+		return true
+	})
 }
 
-// IsLoggedIn 获取平台登录状态
+// IsLoggedIn 获取平台登录状态（线程安全）
 func (pm *PlaywrightManager) IsLoggedIn(platform string) bool {
-	pm.loginStatusMutex.RLock()
-	defer pm.loginStatusMutex.RUnlock()
-	return pm.loginStatus[platform]
+	if status, ok := pm.loginStatus.Load(platform); ok {
+		return status.(bool)
+	}
+	return false
 }
 
 // IsInitialized 检查Playwright是否已初始化
@@ -523,24 +515,26 @@ func (pm *PlaywrightManager) ClearBossCookies() error {
 	return nil
 }
 
-// PauseBossMonitoring 暂停Boss页面的后台登录监控
+// PauseBossMonitoring 暂停Boss页面的后台登录监控（线程安全）
 func (pm *PlaywrightManager) PauseBossMonitoring() {
-	pm.bossMonitoringMutex.Lock()
-	defer pm.bossMonitoringMutex.Unlock()
-	pm.bossMonitoringPaused = true
+	atomic.StoreInt32(&pm.bossMonitoringPaused, 1)
 	log.Println("Boss登录监控已暂停")
 }
 
-// ResumeBossMonitoring 恢复Boss页面的后台登录监控
+// ResumeBossMonitoring 恢复Boss页面的后台登录监控（线程安全）
 func (pm *PlaywrightManager) ResumeBossMonitoring() {
-	pm.bossMonitoringMutex.Lock()
-	defer pm.bossMonitoringMutex.Unlock()
-	pm.bossMonitoringPaused = false
+	atomic.StoreInt32(&pm.bossMonitoringPaused, 0)
 	log.Println("Boss登录监控已恢复")
+}
+
+// IsBossMonitoringPaused 检查Boss监控是否暂停（线程安全）
+func (pm *PlaywrightManager) IsBossMonitoringPaused() bool {
+	return atomic.LoadInt32(&pm.bossMonitoringPaused) == 1
 }
 
 // StartScheduledLoginCheck 启动定时登录状态检查
 func (pm *PlaywrightManager) StartScheduledLoginCheck(ctx context.Context) {
+	log.Println("启动定时登录状态检查器 (3秒间隔)")
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -555,15 +549,17 @@ func (pm *PlaywrightManager) StartScheduledLoginCheck(ctx context.Context) {
 	}
 }
 
-// scheduledLoginCheck 定时检查登录状态
+// scheduledLoginCheck 定时检查登录状态（修复版）
 func (pm *PlaywrightManager) scheduledLoginCheck() {
-	pm.bossMonitoringMutex.RLock()
-	bossPaused := pm.bossMonitoringPaused
-	pm.bossMonitoringMutex.RUnlock()
-
-	if !bossPaused {
-		pm.checkBossLoginStatus()
+	// 使用原子操作检查暂停状态
+	if pm.IsBossMonitoringPaused() {
+		log.Printf("Boss监控已暂停，跳过定时检查")
+		return
 	}
+
+	log.Printf("定时检查Boss登录状态...")
+	// 使用goroutine避免阻塞定时器
+	go pm.checkBossLoginStatus()
 }
 
 // Close 关闭Playwright实例
