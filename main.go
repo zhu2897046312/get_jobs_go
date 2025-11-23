@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"get_jobs_go/config"
 	"get_jobs_go/model"
 	"get_jobs_go/repository"
 	"get_jobs_go/service"
@@ -122,6 +123,8 @@ func (app *Application) InitServices() error {
 	// 初始化Cookie服务
 	cookieService := service.NewCookieService(cookieRepo)
 	app.cookieService = *cookieService
+
+	config.LoadConfig("")
 
 	// 初始化Playwright管理器
 	playwrightManager := playwright_manager.NewPlaywrightManager(

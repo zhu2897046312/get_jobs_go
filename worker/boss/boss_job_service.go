@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"get_jobs_go/config"
 	"get_jobs_go/service"
 	"get_jobs_go/worker/playwright_manager"
 )
@@ -165,7 +166,7 @@ LOGIN_DONE:
 	// =============================
 	// ④ 加载配置
 	// =============================
-	bossConfig, err := s.configService.GetBossConfig()
+	_, err := s.configService.GetBossConfig()
 	if err != nil {
 		progressCallback(JobProgressMessage{
 			Platform:  s.platform,
@@ -195,7 +196,7 @@ LOGIN_DONE:
 	// =============================
 	bossInstance := s.bossProvider()
 	bossInstance.SetPage(page)
-	bossInstance.SetConfig(bossConfig)
+	bossInstance.SetConfig(&config.GlobalConfig.Boss)
 
 	// 设置进度回调
 	bossInstance.SetProgressCallback(func(message string, current, total int) {
