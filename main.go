@@ -59,6 +59,7 @@ func (app *Application) InitDatabase() error {
 
 	app.db = db
 	log.Println("✓ MySQL 数据库连接成功")
+	
 
 	// 自动迁移数据库表
 	if err := db.AutoMigrate(
@@ -131,7 +132,11 @@ func (app *Application) InitServices() error {
 		*cookieService,
 	)
 	app.playwrightManager = playwrightManager
-
+	// 初始化Playwright管理器
+	if err := app.playwrightManager.Init(); err != nil {
+		return fmt.Errorf("Playwright管理器初始化失败: %v", err)
+	}
+	
 	// 初始化Boss任务服务
 	bossJobService := boss.NewBossJobService(
 		playwrightManager,
@@ -141,10 +146,7 @@ func (app *Application) InitServices() error {
 		},
 	)
 	app.bossJobService = bossJobService
-	// 初始化Playwright管理器
-	if err := app.playwrightManager.Init(); err != nil {
-		return fmt.Errorf("Playwright管理器初始化失败: %v", err)
-	}
+	
 	log.Println("✓ 所有服务初始化完成")
 	return nil
 }
