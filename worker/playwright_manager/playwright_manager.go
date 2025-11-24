@@ -295,44 +295,94 @@ func (m *PlaywrightManager) parseCookiesFromString(cookieJSON string) ([]playwri
 	return cookies, nil
 }
 
-// 检查 Boss 是否已登录（结构完全对齐 Java）
-func (pm *PlaywrightManager) checkIfBossLoggedIn() (bool, error) {
-	// 更稳健的登录判断：优先检测用户头像/昵称是否可见；备用检测登录入口是否可见且包含"登录"文本
-	
-	// 1) 用户名/昵称元素
-	userName := pm.bossPage.Locator("li.nav-figure span.label-text").First()
-	if err := userName.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(2000)}); err == nil {
-		visible, err := userName.IsVisible()
-		if err == nil && visible {
-			return true, nil
-		}
-	}
+// 超时执行器：任何 Playwright 操作超过 d 都会被强制中断
+func runWithTimeout[T any](d time.Duration, fn func() (T, error)) (T, error) {
+	ch := make(chan struct {
+		val T
+		err error
+	}, 1)
 
-	// 2) 头像 img
-	avatar := pm.bossPage.Locator("li.nav-figure").First()
-	if err := avatar.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(2000)}); err == nil {
-		visible, err := avatar.IsVisible()
-		if err == nil && visible {
-			return true, nil
-		}
-	}
+	go func() {
+		v, err := fn()
+		ch <- struct {
+			val T
+			err error
+		}{v, err}
+	}()
 
-	// 3) 检查是否存在登录入口（未登录）
-	loginAnchor := pm.bossPage.Locator("li.nav-sign a, .btns").First()
-	if err := loginAnchor.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(2000)}); err == nil {
-		visible, err := loginAnchor.IsVisible()
-		if err == nil && visible {
-			// 检查文本内容是否包含"登录"
-			text, err := loginAnchor.TextContent()
-			if err == nil && strings.Contains(text, "登录") {
-				return false, nil
-			}
-		}
+	select {
+	case res := <-ch:
+		return res.val, res.err
+	case <-time.After(d):
+		var zero T
+		return zero, fmt.Errorf("operation timed out after %v", d)
 	}
-
-	// 无法明确检测到登录特征时，保守返回未登录
-	return false, nil
 }
+
+// 检测登录状态（完整防阻塞版）
+func (pm *PlaywrightManager) checkIfBossLoggedIn() (bool, error) {
+	page := pm.bossPage
+	if page == nil {
+		return false, fmt.Errorf("bossPage is nil")
+	}
+
+	// 最长只允许整个函数执行 5 秒
+	totalTimeout := time.After(5 * time.Second)
+	done := make(chan struct{})
+	var result bool
+	var err error
+
+	go func() {
+		// 统一设置每一步 Playwright 调用的硬超时
+		stepTimeout := 1500 * time.Millisecond
+
+		// --- Step 1：用户昵称 ---
+		userName := page.Locator("li.nav-figure span.label-text").First()
+		visible, _ := runWithTimeout(stepTimeout, func() (bool, error) {
+			return userName.IsVisible()
+		})
+		if visible {
+			result = true
+			close(done)
+			return
+		}
+
+		// --- Step 2：头像 ---
+		avatar := page.Locator("li.nav-figure").First()
+		visible, _ = runWithTimeout(stepTimeout, func() (bool, error) {
+			return avatar.IsVisible()
+		})
+		if visible {
+			result = true
+			close(done)
+			return
+		}
+
+		// --- Step 3：登录入口文本 ---
+		loginAnchor := page.Locator("li.nav-sign a, .btns").First()
+
+		text, _ := runWithTimeout(stepTimeout, func() (string, error) {
+			return loginAnchor.TextContent()
+		})
+		if strings.Contains(text, "登录") {
+			result = false
+			close(done)
+			return
+		}
+
+		// --- 最终无法判断 ---
+		result = false
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return result, err
+	case <-totalTimeout:
+		return false, fmt.Errorf("checkIfBossLoggedIn total timeout (5s)")
+	}
+}
+
 
 func (m *PlaywrightManager) SetLoginStatus(platform string, isLoggedIn bool) {
 	// ========== 1. 获取之前状态 ==========
