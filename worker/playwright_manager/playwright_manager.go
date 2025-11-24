@@ -95,6 +95,8 @@ func (m *PlaywrightManager) IsInitialized() bool {
 }
 
 func (m *PlaywrightManager) Init() error {
+	// 设置日志级别为 Debug
+    log.SetLevel(log.DebugLevel)
 	if m.IsInitialized() {
 		return nil
 	}

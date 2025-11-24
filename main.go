@@ -9,11 +9,12 @@ import (
 	"get_jobs_go/service"
 	"get_jobs_go/worker/boss"
 	"get_jobs_go/worker/playwright_manager"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"log"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
