@@ -6,6 +6,8 @@ import (
 	"log"
 	"math/big"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,18 +23,18 @@ import (
 
 // Boss 结构体对应Java的Boss类
 type Boss struct {
-	page              playwright.Page
-	config            *config.BossConfig
-	bossService       *service.BossService
-	aiService         *service.AiService
-	blackCompanies    map[string]bool
-	blackRecruiters   map[string]bool
-	blackJobs         map[string]bool
-	encryptIdToUserId sync.Map
-	progressCallback  ProgressCallback
+	page               playwright.Page
+	config             *config.BossConfig
+	bossService        *service.BossService
+	aiService          *service.AiService
+	blackCompanies     map[string]bool
+	blackRecruiters    map[string]bool
+	blackJobs          map[string]bool
+	encryptIdToUserId  sync.Map
+	progressCallback   ProgressCallback
 	shouldStopCallback func() bool
-	resultList        []*utils.Job
-	mu                sync.RWMutex
+	resultList         []*utils.Job
+	mu                 sync.RWMutex
 }
 
 // ProgressCallback 进度回调函数类型
@@ -130,7 +132,7 @@ func (b *Boss) Execute() int {
 func (b *Boss) GetResultList() []*utils.Job {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	
+
 	result := make([]*utils.Job, len(b.resultList))
 	copy(result, b.resultList)
 	return result
@@ -235,7 +237,7 @@ func (b *Boss) postJobsByKeyword(searchUrl, keyword string) int {
 // processJobCard 处理单个岗位卡片
 func (b *Boss) processJobCard(card playwright.ElementHandle, index, total int) (*utils.Job, bool) {
 	var detailResp *playwright.Response
-	
+
 	// 点击卡片并等待详情响应
 	if index == 0 && total > 1 {
 		// 第一个卡片特殊处理
@@ -250,8 +252,8 @@ func (b *Boss) processJobCard(card playwright.ElementHandle, index, total int) (
 	responseChan := make(chan *playwright.Response, 1)
 	b.page.OnResponse(func(response playwright.Response) {
 		url := response.URL()
-		if strings.Contains(url, "/wapi/zpgeek/job/detail.json") && 
-		   strings.EqualFold(response.Request().Method(), "GET") {
+		if strings.Contains(url, "/wapi/zpgeek/job/detail.json") &&
+			strings.EqualFold(response.Request().Method(), "GET") {
 			select {
 			case responseChan <- &response:
 			default:
@@ -261,7 +263,7 @@ func (b *Boss) processJobCard(card playwright.ElementHandle, index, total int) (
 
 	// 点击当前卡片
 	card.Click()
-	
+
 	// 等待响应或超时
 	select {
 	case detailResp = <-responseChan:
@@ -304,11 +306,11 @@ func (b *Boss) parseJobDetail(detailResp *playwright.Response) (*utils.Job, bool
 
 	// 构建Job对象
 	job := &utils.Job{
-		JobName:    b.getStringValue(jobInfo, "jobName"),
-		Salary:     b.getStringValue(jobInfo, "salaryDesc"),
+		JobName:     b.getStringValue(jobInfo, "jobName"),
+		Salary:      b.getStringValue(jobInfo, "salaryDesc"),
 		CompanyName: b.getStringValue(brandInfo, "brandName"),
-		Recruiter:  b.getStringValue(bossInfo, "name"),
-		JobInfo:    b.getStringValue(jobInfo, "postDescription"),
+		Recruiter:   b.getStringValue(bossInfo, "name"),
+		JobInfo:     b.getStringValue(jobInfo, "postDescription"),
 	}
 
 	// 构建工作地区
@@ -344,7 +346,7 @@ func (b *Boss) shouldFilterJob(job *utils.Job, bossInfo map[string]interface{}) 
 	if b.config.FilterDeadHR {
 		activeTime := b.getStringValue(bossInfo, "activeTimeDesc")
 		if strings.Contains(activeTime, "年") {
-			log.Printf("被过滤：HR活跃状态包含'年' | 公司：%s | 岗位：%s | 活跃：%s", 
+			log.Printf("被过滤：HR活跃状态包含'年' | 公司：%s | 岗位：%s | 活跃：%s",
 				job.CompanyName, job.JobName, activeTime)
 			return true
 		}
@@ -359,7 +361,7 @@ func (b *Boss) shouldFilterJob(job *utils.Job, bossInfo map[string]interface{}) 
 	// 招聘者黑名单过滤
 	hrPosition := b.getStringValue(bossInfo, "title")
 	if b.isInBlacklist(hrPosition, b.blackRecruiters) {
-		log.Printf("被过滤：招聘者黑名单命中 | 公司：%s | 岗位：%s | 招聘者：%s", 
+		log.Printf("被过滤：招聘者黑名单命中 | 公司：%s | 岗位：%s | 招聘者：%s",
 			job.CompanyName, job.JobName, hrPosition)
 		return true
 	}
@@ -403,7 +405,7 @@ func (b *Boss) resumeSubmission(keyword string, job *utils.Job) bool {
 	}
 
 	detailUrl := "https://www.zhipin.com" + href
-	
+
 	// 在新页面打开详情
 	context := b.page.Context()
 	newPage, err := context.NewPage()
@@ -448,12 +450,12 @@ func (b *Boss) resumeSubmission(keyword string, job *utils.Job) bool {
 		imgResume = b.sendImageResume(newPage)
 	}
 
-	log.Printf("投递完成 | 公司：%s | 岗位：%s | 薪资：%s | 招呼语：%s | 图片简历：%v", 
+	log.Printf("投递完成 | 公司：%s | 岗位：%s | 薪资：%s | 招呼语：%s | 图片简历：%v",
 		job.CompanyName, job.JobName, job.Salary, message, imgResume)
 
 	// 更新投递状态
 	b.updateDeliveryStatus(detailUrl, job)
-	
+
 	b.mu.Lock()
 	b.resultList = append(b.resultList, job)
 	b.mu.Unlock()
@@ -539,7 +541,7 @@ func (b *Boss) sendChatMessage(page playwright.Page, input playwright.ElementHan
 	if err == nil && sendBtn != nil {
 		sendBtn.Click()
 		utils.Sleep(1)
-		
+
 		// 尝试关闭小窗口
 		closeBtn, err := page.QuerySelector("i.icon-close")
 		if err == nil && closeBtn != nil {
@@ -548,12 +550,144 @@ func (b *Boss) sendChatMessage(page playwright.Page, input playwright.ElementHan
 	}
 }
 
-// sendImageResume 发送图片简历
 func (b *Boss) sendImageResume(page playwright.Page) bool {
-	// 实现图片简历发送逻辑
-	// 这里需要根据实际的文件路径和页面元素来实现
-	log.Printf("发送图片简历功能待实现")
-	return false
+	// 0) 资源存在性校验
+	imagePath, err := b.resolveResumeImage()
+	if err != nil {
+		log.Printf("资源文件 resume.jpg 不存在，跳过发送图片简历: %v", err)
+		return false
+	}
+
+	// 检查文件是否存在
+	if _, err := os.Stat(imagePath); os.IsNotExist(err) {
+		log.Printf("资源文件 %s 不存在，跳过发送图片简历", imagePath)
+		return false
+	}
+
+	// 进入聊天页
+	currentURL := page.URL()
+
+	if !contains(currentURL, "/web/geek/chat") {
+		chatBtn := page.Locator("a.btn-startchat, a.op-btn-chat")
+
+		count, err := chatBtn.Count()
+		if err != nil || count == 0 {
+			log.Printf("未找到【继续沟通/立即沟通】按钮，跳过发送图片简历")
+			return false
+		}
+
+		if err := chatBtn.First().Click(); err != nil {
+			log.Printf("点击聊天按钮失败: %v", err)
+			return false
+		}
+
+		// 等待进入聊天页面
+		err = page.WaitForURL("**/web/geek/chat**", playwright.PageWaitForURLOptions{
+			Timeout: playwright.Float(15000),
+		})
+		if err != nil {
+			log.Printf("等待进入聊天页面超时: %v", err)
+			return false
+		}
+	}
+
+	// 精准定位聊天工具栏内的图片输入
+	imgContainer := page.Locator("div.btn-sendimg[aria-label='发送图片'], div[aria-label='发送图片'].btn-sendimg")
+	imageInput := imgContainer.Locator("input[type='file'][accept*='image']").First()
+
+	count, err := imageInput.Count()
+	if err != nil {
+		log.Printf("定位图片输入框失败: %v", err)
+		return false
+	}
+
+	if count == 0 {
+		// 若未渲染，尝试拦截系统文件选择器
+		containerCount, err := imgContainer.Count()
+		if err == nil && containerCount > 0 {
+			chooserHandled := false
+
+			// 设置文件选择器监听
+			fileChooserChan := make(chan playwright.FileChooser, 1)
+			defer close(fileChooserChan)
+
+			page.OnFileChooser(func(chooser playwright.FileChooser) {
+				fileChooserChan <- chooser
+			})
+
+			// 点击图片按钮触发文件选择器
+			if err := imgContainer.First().Click(); err != nil {
+				log.Printf("点击图片按钮失败: %v", err)
+				return false
+			}
+
+			// 等待文件选择器出现（带超时）
+			select {
+			case chooser := <-fileChooserChan:
+				if err := chooser.SetFiles([]string{imagePath}); err != nil {
+					log.Printf("通过 FileChooser 设置文件失败: %v", err)
+					return false
+				}
+				chooserHandled = true
+				log.Printf("通过 FileChooser 直接提交图片文件，避免系统窗口阻塞")
+			case <-time.After(2 * time.Second):
+				// 未弹出系统文件选择器，继续常规流程
+				log.Printf("未检测到文件选择器，尝试常规上传方式")
+			}
+
+			if !chooserHandled {
+				time.Sleep(1 * time.Second)
+				// 重新定位输入框
+				imageInput = imgContainer.Locator("input[type='file'][accept*='image']").First()
+			}
+		}
+	}
+
+	// 等待输入框可用
+	if err := imageInput.WaitFor(playwright.LocatorWaitForOptions{
+		Timeout: playwright.Float(10000),
+	}); err != nil {
+		log.Printf("等待图片输入框超时: %v", err)
+		return false
+	}
+
+	// 上传图片
+	if err := imageInput.SetInputFiles([]string{imagePath}); err != nil {
+		log.Printf("上传图片失败: %v", err)
+		return false
+	}
+
+	time.Sleep(1 * time.Second)
+	return true
+}
+
+// resolveResumeImage 解析简历图片路径
+func (b *Boss) resolveResumeImage() (string, error) {
+	// 尝试多种路径方案
+	possiblePaths := []string{
+		"resume.jpg",
+		"./resume.jpg",
+		"../resume.jpg",
+		"assets/resume.jpg",
+		"static/resume.jpg",
+	}
+
+	for _, path := range possiblePaths {
+		if _, err := os.Stat(path); err == nil {
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				return "", err
+			}
+			return absPath, nil
+		}
+	}
+
+	return "", os.ErrNotExist
+}
+
+// contains 检查字符串是否包含子串
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && (s[:len(substr)] == substr || contains(s[1:], substr)))
 }
 
 // updateDeliveryStatus 更新投递状态
@@ -561,7 +695,7 @@ func (b *Boss) updateDeliveryStatus(detailUrl string, job *utils.Job) {
 	encryptId := b.extractEncryptId(detailUrl)
 	if encryptId != "" {
 		// 这里需要根据实际的数据库操作来实现状态更新
-		log.Printf("更新投递状态 | 公司：%s | 岗位：%s | encryptId：%s", 
+		log.Printf("更新投递状态 | 公司：%s | 岗位：%s | encryptId：%s",
 			job.CompanyName, job.JobName, encryptId)
 	}
 }

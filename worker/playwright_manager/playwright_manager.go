@@ -484,13 +484,13 @@ func (m *PlaywrightManager) setupLoginMonitoring(page playwright.Page) {
 		}
 
 		// 执行登录状态检测
-		m.checkLoginStatus(page, "boss")
+		m.checkLoginStatus("boss")
 	})
 
 	log.Info("Boss 平台登录状态监控已启用")
 }
 
-func (m *PlaywrightManager) checkLoginStatus(page playwright.Page, platform string) {
+func (m *PlaywrightManager) checkLoginStatus( platform string) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Debugf("检查 %s 平台登录状态时发生异常: %v", platform, r)
@@ -651,7 +651,7 @@ func (m *PlaywrightManager) startScheduledLoginCheck() {
 						}
 					}()
 
-					m.checkLoginStatus(m.bossPage, "boss")
+					m.checkLoginStatus("boss")
 				}()
 
 				log.Debug("Boss 登录检测完成")
